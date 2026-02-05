@@ -1,0 +1,1497 @@
+/*
+ * SPDX-FileCopyrightText: 2021-2024 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Unlicense OR CC0-1.0
+ */
+
+/****************************************************************************
+*
+* This demo showcases BLE GATT server. It can send adv data, be connected by client.
+* Run the gatt_client demo, the client demo will automatically connect to the gatt_server demo.
+* Client demo will enable gatt_server's notify after connection. The two devices will then exchange
+* data.
+*
+****************************************************************************/
+#pragma GCC push_options
+#pragma GCC optimize ("O0")
+#pragma GCC pop_options
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/ringbuf.h"
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"
+
+#include "esp_system.h"
+#include "esp_log.h"
+
+
+#include "driver/spi_master.h"
+#include "driver/gpio.h"
+#include "driver/i2c_master.h"
+
+
+#include "soc/usb_serial_jtag_struct.h"
+#include "esp_intr_alloc.h"
+#include "soft_spi.h"
+#include "esp_heap_caps.h"
+#include "sdkconfig.h"
+
+#include "nvs_flash.h"
+#include "esp_bt.h"
+#include "esp_gap_ble_api.h"
+#include "esp_gatts_api.h"
+#include "esp_bt_defs.h"
+#include "esp_bt_main.h"
+#include "esp_bt_device.h"
+#include "esp_gatt_common_api.h"
+#include "esp_timer.h"
+
+static const char TAG[] = "main";
+
+#define CUSTOM_SPI_HOST     SPI2_HOST
+#define CUSTOM_I2C_HOST     I2C_NUM_0
+/*
+PIN mapping 
+*/
+#define AFE44X0_PIN_MISO        7
+#define AFE44X0_PIN_MOSI        6
+#define AFE44X0_PIN_CLK         12
+#define AFE44X0_PIN_CS          5
+#define AFE44X0_PIN_PDNZ        13
+#define AFE44X0_PIN_RDY         4
+
+#define ADS1220_PIN_MISO        21
+#define ADS1220_PIN_MOSI        22
+#define ADS1220_PIN_CLK         18
+#define ADS1220_PIN_CS          19
+#define ADS1220_PIN_RDY         20
+
+#define ADXL_PIN_SCL            2
+#define ADXL_PIN_SDA            3
+#define ADXL_PIN_INT1           1
+/*
+ AFE4400 initialization registers
+*/
+#define LED2STC             0x01
+#define LED2STC_VAL         0x17c0        // for 100HZ - 30080
+#define LED2ENDC            0x02
+#define LED2ENDC_VAL        0x1f3e        // for 100HZ - 37998
+#define LED2LEDSTC          0x03
+#define LED2LEDSTC_VAL      0x1770                // for 100HZ - 30000
+#define LED2LEDENDC         0x04
+#define LED2LEDENDC_VAL     0x1f3f                // for 100HZ - 37999
+#define ALED2STC            0x05
+#define ALED2STC_VAL        0x50                              // for 100HZ - 80
+#define ALED2ENDC           0x06
+#define ALED2ENDC_VAL       0x7ce                       // for 100HZ - 7998
+#define LED1STC             0x07
+#define LED1STC_VAL         0x820                // for 100HZ - 10080
+#define LED1ENDC            0x08
+#define LED1ENDC_VAL        0xf9e        // for 100HZ - 17998
+#define LED1LEDSTC          0x09
+#define LED1LEDSTC_VAL      0x7d0                // for 100HZ - 10000
+#define LED1LEDENDC         0x0A
+#define LED1LEDENDC_VAL     0xf9f               // for 100HZ - 17999
+#define ALED1STC            0x0B
+#define ALED1STC_VAL        0xff0                // for 100HZ - 20080
+#define ALED1ENDC           0x0C
+#define ALED1ENDC_VAL       0x176e      // for 100HZ - 27998
+#define LED2CONVST          0x0D
+#define LED2CONVST_VAL      0x06              // for 100HZ - 6
+#define LED2CONVEND         0x0E
+#define LED2CONVEND_VAL     0x7cf        // for 100HZ - 9999
+#define ALED2CONVST         0x0F
+#define ALED2CONVST_VAL     0x7d6                  // for 100HZ - 10006
+#define ALED2CONVEND        0x10
+#define ALED2CONVEND_VAL    0xf9f      // for 100HZ - 19999
+#define LED1CONVST          0x11
+#define LED1CONVST_VAL      0xfa6     // for 100HZ - 20006
+#define LED1CONVEND         0x12
+#define LED1CONVEND_VAL     0x176f        // for 100HZ - 29999
+#define ALED1CONVST         0x13
+#define ALED1CONVST_VAL     0x1776     // for 100HZ - 30006
+#define ALED1CONVEND        0x14
+#define ALED1CONVEND_VAL    0x1f3f      // for 100HZ - 39999
+#define ADCRSTSTCT0         0x15
+#define ADCRSTSTCT0_VAL     0x0       // for 100HZ - 0
+#define ADCRSTENDCT0        0x16
+#define ADCRSTENDCT0_VAL    0x5       // for 100HZ - 5
+#define ADCRSTSTCT1         0x17
+#define ADCRSTSTCT1_VAL     0x7d0      // for 100HZ - 10000
+#define ADCRSTENDCT1        0x18
+#define ADCRSTENDCT1_VAL    0x7d5       // for 100HZ - 10005
+#define ADCRSTSTCT2         0x19
+#define ADCRSTSTCT2_VAL     0xfa0  // for 100HZ - 20000
+#define ADCRSTENDCT2        0x1A
+#define ADCRSTENDCT2_VAL    0xfa5       // for 100HZ - 20005
+#define ADCRSTSTCT3         0x1B
+#define ADCRSTSTCT3_VAL     0x1770  // for 100HZ - 30000
+#define ADCRSTENDCT3        0x1C
+#define ADCRSTENDCT3_VAL    0x1775       // for 100HZ - 30005
+#define PRPCOUNT            0x1D
+#define PRPCOUNT_VAL        0x1f3f
+#define CONTROL1            0x1E
+#define CONTROL1_VAL        0x101
+#define TIA_AMB             0x21
+#define TIA_AMB_VAL         0x0
+#define LEDCNTRL            0x22
+#define LEDCNTRL_VAL        0x014444
+#define CONTROL2            0x23
+#define CONTROL2_VAL        0x20100
+#define ALARM               0x29
+#define ALARM_VAL           0x0
+#define CONTROL0            0x00
+#define CONTROL0_VAL        0x1
+#define CONTROL0_WR         0x00
+#define CONTROL0_WR_VAL     0x0
+
+/*ADS CMD*/
+#define ADS_CMD_RESET       0x06
+#define ADS_CMD_START       0x08
+#define ADS_CMD_PWDN        0x02
+#define ADS_CMD_RDATA       0x10
+#define ADS_CMD_RREG_4      0x20
+#define ADS_CMD_WREG_4      0x40
+
+/*ADXL CMD*/
+#define ADXL_ADDRESS        0X53
+#define ADXL_POWER_CTL      0x2D
+#define ADXL_BW_RATE        0x2C
+#define ADXL_INT_ENABLE     0x2E
+#define ADXL_INT_MAP        0x2F 
+#define ADXL_DATA_FORMAT    0x31
+#define ADXL_DATAX0         0x32 //0x32~0x37
+
+/*----------------async i2c related*/
+#define I2C_DEVICE	        ADXL_ADDRESS // DS3231 RTC Clock addr
+#define I2C_DEVICE_REG	    ADXL_DATAX0 // Device register from which to start reading I2C_DEVICE_NBYTES
+#define I2C_DEVICE_NBYTES   6   // Number of bytes to read via i2c_master_transmit_receive()
+
+// You probably don't need to change these:
+#define I2C_TASK_PRIO       10
+#define I2C_TIMEOUT_MS      100
+
+static i2c_master_dev_handle_t i2c_dev_handle;
+//---------------------------------------------
+
+void AFE44x0_Reg_Read_dec_soft(soft_spi_bus_t spi,unsigned char addr,unsigned char* rd_buffer);
+void AFE44x0_Reg_Write_dec_soft(soft_spi_bus_t spi,unsigned char addr,unsigned long val);
+void ADS1220_readData(spi_device_handle_t spi,uint8_t* data_out);
+void ADS1220_sendCMD(spi_device_handle_t spi,spi_transaction_t* trans_reg,uint8_t CMD);
+void ADS1220_writeReg(spi_device_handle_t spi,spi_transaction_t* trans_reg, uint8_t addr,uint8_t val);
+uint8_t ADS1220_readReg(spi_device_handle_t spi,spi_transaction_t* trans_reg, uint8_t addr);
+void ADS1220_readData(spi_device_handle_t spi,uint8_t* data_out);
+
+/**********************************************************
+ * Thread/Task reference
+ **********************************************************/
+
+
+static volatile int ads_interrupt_val = 0;
+static volatile int afe_interrupt_val = 0;
+static volatile int adxl_interrupt_val = 0;
+
+#define RINGBUFFER_SIZE     128
+// static RingbufHandle_t afe_buffers;
+// static RingbufHandle_t ads_buffers;
+// static RingbufHandle_t adxl_buffers;
+#define RINGBUFFER_SIZE_T   256 //& 0xff
+static uint8_t afe_buffers_ext[RINGBUFFER_SIZE_T];
+volatile uint16_t afe_buf_head = 0,afe_buf_tail = 0;
+static uint8_t ads_buffers_ext[RINGBUFFER_SIZE_T];
+volatile uint16_t ads_buf_head = 0,ads_buf_tail = 0;
+static uint8_t adxl_buffers_ext[RINGBUFFER_SIZE_T];
+volatile uint16_t adxl_buf_head = 0,adxl_buf_tail = 0;
+
+/*spi handles of devices*/
+static soft_spi_bus_t       s_spi_bus;
+static spi_device_handle_t  ads_spi;
+
+/*
+DO NOT use any io interface in interrupt handler,but or software based spi is ultra fast (around 13MHz).
+it takes 1us for a single byte transmission, whitch is acceptable.
+*/
+static volatile uint8_t afe_4400rdbuff[4];
+//static uint8_t afe_4400rdbuff_all[6];
+/*INTERRUPT HANDLER OF AFE4400*/
+__attribute__((optimize("O2"))) 
+void IRAM_ATTR AFE44X0_gpio_isr_handler(void* arg) 
+{
+    /*we do not process spi in isr,but in an outside task*/
+    //BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+   // vTaskNotifyGiveFromISR(afe_task_handle, &xHigherPriorityTaskWoken);  
+    //portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    AFE44x0_Reg_Read_dec_soft(s_spi_bus,0x2C,afe_4400rdbuff); //use delicated io based software spi
+    afe_buffers_ext[afe_buf_head] = afe_4400rdbuff[1];
+    afe_buf_head = (afe_buf_head+1)& 0xff;
+    afe_buffers_ext[afe_buf_head] = afe_4400rdbuff[2];
+    afe_buf_head = (afe_buf_head+1)& 0xff;
+    afe_buffers_ext[afe_buf_head] = afe_4400rdbuff[3];
+    afe_buf_head = (afe_buf_head+1)& 0xff;
+    //afe_4400rdbuff_all[0] = afe_4400rdbuff[1];
+    //afe_4400rdbuff_all[1] = afe_4400rdbuff[2];
+    //afe_4400rdbuff_all[2] = afe_4400rdbuff[3];
+    //memcpy(afe_4400rdbuff_all,afe_4400rdbuff+1,3);
+    AFE44x0_Reg_Read_dec_soft(s_spi_bus,0x2A,afe_4400rdbuff);
+    afe_buffers_ext[afe_buf_head] = afe_4400rdbuff[1];
+    afe_buf_head = (afe_buf_head+1)& 0xff;
+    afe_buffers_ext[afe_buf_head] = afe_4400rdbuff[2];
+    afe_buf_head = (afe_buf_head+1)& 0xff;
+    afe_buffers_ext[afe_buf_head] = afe_4400rdbuff[3];
+    afe_buf_head = (afe_buf_head+1)& 0xff;
+    //afe_4400rdbuff_all[3] = afe_4400rdbuff[1];
+    //afe_4400rdbuff_all[4] = afe_4400rdbuff[2];
+    //afe_4400rdbuff_all[5] = afe_4400rdbuff[3];
+    //memcpy(afe_4400rdbuff_all+3,afe_4400rdbuff+1,3);
+    //xRingbufferSendFromISR(afe_buffers,afe_4400rdbuff_all,6,0);
+    afe_interrupt_val ++;
+}
+
+static volatile uint8_t curr_channel = 0;
+static spi_transaction_t ads_rxtrans_32 = {.flags = SPI_TRANS_USE_RXDATA | SPI_TRANS_USE_TXDATA,.length = 32,.tx_data[0] = ADS_CMD_RDATA};
+static spi_transaction_t ads_txtrans_16 = {.flags = SPI_TRANS_USE_TXDATA,.length = 16,.tx_data[0] = ADS_CMD_RREG_4};
+static spi_transaction_t ads_txtrans_8 = {.flags = SPI_TRANS_USE_TXDATA,.length = 8,.tx_data[0] = ADS_CMD_START};
+static volatile uint8_t ads_saved_data[12];
+static volatile uint8_t ads_curr_channel_start;
+/*INTERRUPT HANDLER OF ADS1220, by using spi task queue, return  at once*/
+__attribute__((optimize("O2"))) 
+void IRAM_ATTR ADS1220_gpio_isr_handler(void* arg)
+{
+        //read buffer from last transmisson
+        ads_curr_channel_start = curr_channel*3;
+        ads_saved_data[ads_curr_channel_start]      = ads_rxtrans_32.rx_data[1];
+        ads_saved_data[ads_curr_channel_start+1]    = ads_rxtrans_32.rx_data[2];
+        ads_saved_data[ads_curr_channel_start+2]    = ads_rxtrans_32.rx_data[3];
+        //memcpy(&ads_saved_data[curr_channel*3],&(result[0].rx_data[1]),3); // copy to send data buffer
+        //write data to ring buffer
+        if(curr_channel == 3)
+        {
+            //witch is faster?
+            
+            int reamains = (ads_buf_head + 12) - RINGBUFFER_SIZE_T;
+            if(reamains <  0)
+            {
+                memcpy(&ads_buffers_ext[ads_buf_head],ads_saved_data,12);
+                ads_buf_head += 12;
+            }
+            else
+            {
+                uint16_t first_part = 12 - reamains;
+                memcpy(&ads_buffers_ext[ads_buf_head],ads_saved_data,first_part);
+                memcpy(ads_buffers_ext,&ads_saved_data[first_part],reamains);
+                ads_buf_head = reamains;
+            }
+            
+             //xRingbufferSendFromISR(ads_buffers,ads_saved_data,12,0);
+        }
+        curr_channel = (curr_channel == 3) ? 0: curr_channel + 1 ;
+        ads_interrupt_val++;
+        ads_txtrans_16.tx_data[1] = ((8 + curr_channel)<<4) | (0 <<1) | 0 ; 
+        //finally send the next transaction quest
+        spi_device_queue_trans(ads_spi,&ads_rxtrans_32,0);
+        spi_device_queue_trans(ads_spi,&ads_txtrans_16,0);
+        spi_device_queue_trans(ads_spi,&ads_txtrans_8,0);
+}
+
+
+	//ESP_ERROR_CHECK(i2c_master_register_event_callbacks(i2c_dev_handle, &cbs, NULL) != ESP_OK);
+static uint8_t i2c_target = I2C_DEVICE_REG; //read from datax0
+static volatile uint8_t i2c_recv_data[I2C_DEVICE_NBYTES];
+/*INTERRUPT HANDLER OF ADXL345*/
+__attribute__((optimize("O2"))) 
+void IRAM_ATTR ADXL345_gpio_isr_handler(void* arg)
+{
+    //step1: read and write data to ringbuffer  from last trasmission
+    adxl_buffers_ext[adxl_buf_head] = i2c_recv_data[0];
+    adxl_buf_head = ((adxl_buf_head+1) & 0xff);
+    adxl_buffers_ext[adxl_buf_head] = i2c_recv_data[1];
+    adxl_buf_head = ((adxl_buf_head+1) & 0xff);
+    adxl_buffers_ext[adxl_buf_head] = i2c_recv_data[2];
+    adxl_buf_head = ((adxl_buf_head+1) & 0xff);
+    adxl_buffers_ext[adxl_buf_head] = i2c_recv_data[3];
+    adxl_buf_head = ((adxl_buf_head+1) & 0xff);
+    adxl_buffers_ext[adxl_buf_head] = i2c_recv_data[4];
+    adxl_buf_head = ((adxl_buf_head+1) & 0xff);
+    adxl_buffers_ext[adxl_buf_head] = i2c_recv_data[5];
+    adxl_buf_head = ((adxl_buf_head+1) & 0xff);
+    //xRingbufferSendFromISR(adxl_buffers,i2c_recv_data,I2C_DEVICE_NBYTES,0);
+    //step2: start another trasmission
+    i2c_master_transmit_receive(i2c_dev_handle, (void *) &i2c_target, 1,
+        (uint8_t*)i2c_recv_data, I2C_DEVICE_NBYTES, I2C_TIMEOUT_MS);
+    adxl_interrupt_val++;
+}
+void AFE44x0_Reg_Write(spi_device_handle_t spi,unsigned char addr,unsigned long val)
+{
+    spi_transaction_t trans;
+    memset(&trans,0,sizeof(spi_transaction_t));
+    trans.length = 32;
+    trans.user = (void*)0;
+    trans.flags = SPI_TRANS_USE_TXDATA;
+    trans.tx_data[0] = addr;
+    trans.tx_data[1] = ((val & 0xffffff)>>16);
+    trans.tx_data[2] = ((val & 0xffff)>>8);
+    trans.tx_data[3] = (val & 0xff);
+    esp_err_t ret = spi_device_transmit(spi, &trans);
+    assert(ret == ESP_OK);
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+}
+void IRAM_ATTR AFE44x0_Reg_Write_dec_soft(soft_spi_bus_t spi,unsigned char addr,unsigned long val)
+{
+    esp_err_t ret;
+    uint8_t wr_buffer[4];
+    uint8_t rd_buffer[4];
+    wr_buffer[0] = addr;
+    wr_buffer[1] = (val & 0xffffff)>>16;
+    wr_buffer[2] = ((val & 0xffff)>>8);
+    wr_buffer[3] = (val & 0xff);
+    ret = soft_spi_transfer(spi,wr_buffer,rd_buffer,4);
+    assert(ret == ESP_OK);
+}
+/*
+delicated gpio based spi interface ~ 5MHz
+*/
+void IRAM_ATTR AFE44x0_Reg_Read_dec_soft(soft_spi_bus_t spi,unsigned char addr,unsigned char* rd_buffer)
+{
+    uint8_t wr_buffer[4];
+    wr_buffer[0] = addr;
+    wr_buffer[1] = 0;
+    wr_buffer[2] = 0;
+    wr_buffer[3] = 0;
+
+    soft_spi_transfer(spi,wr_buffer,rd_buffer,4);
+    /*
+    assert(ret == ESP_OK);
+    val = val | (uint32_t)rd_buffer[1] << 16;
+    val = val | (uint32_t)rd_buffer[2] << 8;
+    val = val | (uint32_t)rd_buffer[3];
+    return val;
+    */
+}
+
+void AFE44x0_Initialization_software(soft_spi_bus_t spi)
+{
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)LED2STC, (unsigned long)LED2STC_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)LED2STC, (unsigned long)LED2STC_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)LED2ENDC, (unsigned long)LED2ENDC_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)LED2LEDSTC, (unsigned long)LED2LEDSTC_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)LED2LEDENDC, (unsigned long)LED2LEDENDC_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ALED2STC, (unsigned long)ALED2STC_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ALED2ENDC, (unsigned long)ALED2ENDC_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)LED1STC, (unsigned long)LED1STC_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)LED1ENDC, (unsigned long)LED1ENDC_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)LED1LEDSTC, (unsigned long)LED1LEDSTC_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)LED1LEDENDC, (unsigned long)LED1LEDENDC_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ALED1STC, (unsigned long)ALED1STC_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ALED1ENDC, (unsigned long)ALED1ENDC_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)LED2CONVST, (unsigned long)LED2CONVST_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)LED2CONVEND, (unsigned long)LED2CONVEND_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ALED2CONVST, (unsigned long)ALED2CONVST_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ALED2CONVEND, (unsigned long)ALED2CONVEND_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)LED1CONVST, (unsigned long)LED1CONVST_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)LED1CONVEND, (unsigned long)LED1CONVEND_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ALED1CONVST, (unsigned long)ALED1CONVST_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ALED1CONVEND, (unsigned long)ALED1CONVEND_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ADCRSTSTCT0, (unsigned long)ADCRSTSTCT0_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ADCRSTENDCT0, (unsigned long)ADCRSTENDCT0_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ADCRSTSTCT1, (unsigned long)ADCRSTSTCT1_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ADCRSTENDCT1, (unsigned long)ADCRSTENDCT1_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ADCRSTSTCT2, (unsigned long)ADCRSTSTCT2_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ADCRSTENDCT2, (unsigned long)ADCRSTENDCT2_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ADCRSTSTCT3, (unsigned long)ADCRSTSTCT3_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ADCRSTENDCT3, (unsigned long)ADCRSTENDCT3_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)PRPCOUNT, (unsigned long)PRPCOUNT_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)CONTROL1, (unsigned long)CONTROL1_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)TIA_AMB, (unsigned long)TIA_AMB_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)LEDCNTRL, (unsigned long)LEDCNTRL_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)CONTROL2, (unsigned long)CONTROL2_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)ALARM, (unsigned long)ALARM_VAL);
+    AFE44x0_Reg_Write_dec_soft(spi,(unsigned char)CONTROL0, (unsigned long)CONTROL0_VAL);
+}
+/*ads operations*/
+void ADS1220_writeReg(spi_device_handle_t spi,spi_transaction_t* trans_reg, uint8_t addr,uint8_t val)
+{
+    trans_reg->tx_data[0] = ADS_CMD_WREG_4 | (addr<<2);
+    trans_reg->tx_data[1] = val;
+    spi_device_transmit(spi,trans_reg);
+}
+uint8_t ADS1220_readReg(spi_device_handle_t spi,spi_transaction_t* trans_reg, uint8_t addr)
+{
+
+    trans_reg->tx_data[0] = ADS_CMD_RREG_4 | (addr << 2);
+    trans_reg->tx_data[1] = 0; //dummy bit
+    spi_device_transmit(spi,trans_reg);
+    return trans_reg->rx_data[1];   
+}
+void ADS1220_sendCMD(spi_device_handle_t spi,spi_transaction_t* trans_reg,uint8_t CMD)
+{
+    trans_reg -> tx_data[0] = CMD;
+    spi_device_transmit(spi,trans_reg);
+}
+void ADS1220_initialization(spi_device_handle_t spi)
+{
+    spi_transaction_t trans_8 ={
+        .length = 8,
+        .flags = SPI_TRANS_USE_TXDATA
+    };
+    spi_transaction_t trans_16 ={
+        .length = 16,
+        .flags = SPI_TRANS_USE_TXDATA
+    };    
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+    ADS1220_sendCMD(spi,&trans_8,ADS_CMD_RESET);
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+    ADS1220_writeReg(spi,&trans_16,0,0);                                //MUX channel[7:4], GAIN[3:1],PGA_BYPASS[0] (gain = 1, pga_bypass = 0)
+    ADS1220_writeReg(spi,&trans_16,1,(6<<5)|(2<<3)|(0<<2)|(0<<1)|(0));  //DR[7:5],MODE[4:3],CM[2],TS[1],BCS[0] （2000sps,turbo mode single shot)
+    ADS1220_writeReg(spi,&trans_16,2,(0<<6)|(1<<4)|(0<<3)|(0));         //VREF[7:6],50/60FULTER[5:0=4],PSW[3],IDAC[2:0];(internal vref,50Hz/60Hz-rejection)
+    ADS1220_writeReg(spi,&trans_16,3,1<<1);                                //(dont use IDAC, drdy mode set to when data is ready)
+    ADS1220_sendCMD(spi,&trans_8,ADS_CMD_START);
+}
+
+void ADXL345_initialization(i2c_master_dev_handle_t dev_handle)
+{
+
+    volatile uint8_t data_wr[2] = {0};
+    volatile uint8_t data_rd = 0;
+    volatile esp_err_t i2c_err;
+    //test device id first since last transaction may not complete, leading to error result.
+    while(1)
+    {
+
+        data_wr[0] = 0;
+        data_rd = 0;
+        //test device id reading first
+        i2c_err = i2c_master_transmit_receive(dev_handle, &data_wr[0], 1, &data_rd, 1, 0);
+        ESP_ERROR_CHECK(i2c_err);
+        vTaskDelay(pdMS_TO_TICKS(10)); // wait for transaction complete
+        ESP_LOGI("ADXL345","ADXL_ADDRESS_TEST: 0x%02X",data_rd);
+        if(data_rd == 0xE5)
+        {
+            ESP_LOGI("ADXL345","Device DEVID read PASSED");
+            break;
+        }
+        else
+        {
+            ESP_LOGI("ADXL345","Device DEVID read FAILED,try to read again");
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    while(1)
+    {
+        data_wr[0] = ADXL_POWER_CTL;
+        data_wr[1] = 0x4;//set to sleep mode first
+        i2c_err = i2c_master_transmit(dev_handle, data_wr, 2, 100);
+        ESP_ERROR_CHECK(i2c_err);
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        data_wr[0] = ADXL_INT_ENABLE;
+        data_wr[1] = 0x00; //disabling all interrupt setting first
+        i2c_err = i2c_master_transmit(dev_handle, data_wr, 2, 100);
+        ESP_ERROR_CHECK(i2c_err);
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        data_wr[0] = ADXL_DATA_FORMAT;
+        data_wr[1] = 0x2;//set range to 8 g
+        i2c_err = i2c_master_transmit(dev_handle, data_wr, 2, 100);
+        ESP_ERROR_CHECK(i2c_err);
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        data_wr[0] = ADXL_BW_RATE;
+        data_wr[1] = 0x0D;//800,lets see if these can work under these i2c setting <- 1600 hz at turbo 400khz mode is fine
+        i2c_err = i2c_master_transmit(dev_handle, data_wr, 2, 100);
+        ESP_ERROR_CHECK(i2c_err);
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        data_wr[0] = ADXL_INT_MAP;
+        data_wr[1] = 0x7F; //set all other to int2, set data ready to int1
+        i2c_err = i2c_master_transmit(dev_handle, data_wr, 2, 100);
+        ESP_ERROR_CHECK(i2c_err);
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        data_wr[0] = ADXL_INT_ENABLE;
+        data_wr[1] = 0x80; //enbale data_ready interrupt ?????? WHY SET THIS TO 0X00 LEAD CORRECT RESULT ??? SUPPOSE TO BE 0X80 <- problem sovled,the adxl handler task is triggered by twice
+        i2c_err = i2c_master_transmit(dev_handle, data_wr, 2, 100);
+        ESP_ERROR_CHECK(i2c_err);
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+
+        data_wr[0] = ADXL_POWER_CTL;
+        data_wr[1] = 0x8;//set to measure mode
+        i2c_err = i2c_master_transmit(dev_handle, data_wr, 2, 100);
+        ESP_ERROR_CHECK(i2c_err);
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        data_wr[0] = 0;
+        data_rd = 0;
+        //test device id reading first
+        i2c_err = i2c_master_transmit_receive(dev_handle, &data_wr[0], 1, &data_rd, 1, 100);
+        ESP_ERROR_CHECK(i2c_err);
+        vTaskDelay(pdMS_TO_TICKS(10)); // wait for transaction complete
+        ESP_LOGI("ADXL345","ADXL_ADDRESS_TEST: 0x%02X",data_rd);
+        if(data_rd == 0xE5)
+        {
+            ESP_LOGI("ADXL345","Device DEVID read PASSED");
+            break;
+        }
+        else
+        {
+            ESP_LOGI("ADXL345","Device DEVID read FAILED,try to reconfiguration");
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+//-------------------------------------------------------------------
+//-------------------------------------------------------------------
+//------------------------BLE initialization-------------------------
+//-------------------------------------------------------------------
+//-------------------------------------------------------------------
+//-------------------------------------------------------------------
+#define GATTS_TAG "GATTS_DEMO"
+#define GATTS_NOTIFY_LEN    512
+#define BLUETOOTH_TASK_PINNED_TO_CORE              (CONFIG_BLUEDROID_PINNED_TO_CORE < CONFIG_FREERTOS_NUMBER_OF_CORES ? CONFIG_BLUEDROID_PINNED_TO_CORE : tskNO_AFFINITY)
+
+static volatile uint8_t ble_packet_data[GATTS_NOTIFY_LEN];
+
+///Declare the static function
+static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
+
+#define GATTS_SERVICE_UUID_TEST_A   0x00FF
+#define GATTS_CHAR_UUID_TEST_A      0xFF01
+#define GATTS_DESCR_UUID_TEST_A     0x3333
+#define GATTS_NUM_HANDLE_TEST_A     4
+
+#define GATTS_SERVICE_UUID_TEST_B   0x00EE
+#define GATTS_CHAR_UUID_TEST_B      0xEE01
+#define GATTS_DESCR_UUID_TEST_B     0x2222
+#define GATTS_NUM_HANDLE_TEST_B     4
+
+static char test_device_name[ESP_BLE_ADV_NAME_LEN_MAX] = "BLE_SERVER";
+
+#define TEST_MANUFACTURER_DATA_LEN  17
+
+#define GATTS_DEMO_CHAR_VAL_LEN_MAX 0x40
+
+#define PREPARE_BUF_MAX_SIZE 1024
+
+static volatile bool is_connect = false;
+static volatile bool can_send_notify = false;
+static SemaphoreHandle_t gatts_semaphore;
+
+static uint8_t char1_str[] = {0x11,0x22,0x33};
+static esp_gatt_char_prop_t a_property = 0;
+
+static esp_attr_value_t gatts_demo_char1_val =
+{
+    .attr_max_len = GATTS_DEMO_CHAR_VAL_LEN_MAX,
+    .attr_len     = sizeof(char1_str),
+    .attr_value   = char1_str,
+};
+
+static uint8_t adv_config_done = 0;
+#define adv_config_flag      (1 << 0)
+#define scan_rsp_config_flag (1 << 1)
+
+#ifdef CONFIG_EXAMPLE_SET_RAW_ADV_DATA
+static uint8_t raw_adv_data[] = {
+    /* Flags */
+    0x02, ESP_BLE_AD_TYPE_FLAG, 0x06,               // Length 2, Data Type ESP_BLE_AD_TYPE_FLAG, Data 1 (LE General Discoverable Mode, BR/EDR Not Supported)
+    /* TX Power Level */
+    0x02, ESP_BLE_AD_TYPE_TX_PWR, 0xEB,             // Length 2, Data Type ESP_BLE_AD_TYPE_TX_PWR, Data 2 (-21)
+    /* Complete 16-bit Service UUIDs */
+    0x03, ESP_BLE_AD_TYPE_16SRV_CMPL, 0xAB, 0xCD    // Length 3, Data Type ESP_BLE_AD_TYPE_16SRV_CMPL, Data 3 (UUID)
+};
+
+static uint8_t raw_scan_rsp_data[] = {
+    /* Complete Local Name */
+    0x0F, ESP_BLE_AD_TYPE_NAME_CMPL, 'E', 'S', 'P', '_', 'G', 'A', 'T', 'T', 'S', '_', 'D', 'E', 'M', 'O'   // Length 15, Data Type ESP_BLE_AD_TYPE_NAME_CMPL, Data (ESP_GATTS_DEMO)
+};
+#else
+
+static uint8_t adv_service_uuid128[32] = {
+    /* LSB <--------------------------------------------------------------------------------> MSB */
+    //first uuid, 16bit, [12],[13] is the value
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0xEE, 0x00, 0x00, 0x00,
+    //second uuid, 32bit, [12], [13], [14], [15] is the value
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00,
+};
+
+// The length of adv data must be less than 31 bytes
+//static uint8_t test_manufacturer[TEST_MANUFACTURER_DATA_LEN] =  {0x12, 0x23, 0x45, 0x56};
+//adv data
+static esp_ble_adv_data_t adv_data = {
+    .set_scan_rsp = false,
+    .include_name = true,
+    .include_txpower = false,
+    .min_interval = 0x0006, //slave connection min interval, Time = min_interval * 1.25 msec
+    .max_interval = 0x0010, //slave connection max interval, Time = max_interval * 1.25 msec
+    .appearance = 0x00,
+    .manufacturer_len = 0, //TEST_MANUFACTURER_DATA_LEN,
+    .p_manufacturer_data =  NULL, //&test_manufacturer[0],
+    .service_data_len = 0,
+    .p_service_data = NULL,
+    .service_uuid_len = sizeof(adv_service_uuid128),
+    .p_service_uuid = adv_service_uuid128,
+    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
+};
+// scan response data
+static esp_ble_adv_data_t scan_rsp_data = {
+    .set_scan_rsp = true,
+    .include_name = true,
+    .include_txpower = true,
+    //.min_interval = 0x0006,
+    //.max_interval = 0x0010,
+    .appearance = 0x00,
+    .manufacturer_len = 0, //TEST_MANUFACTURER_DATA_LEN,
+    .p_manufacturer_data =  NULL, //&test_manufacturer[0],
+    .service_data_len = 0,
+    .p_service_data = NULL,
+    .service_uuid_len = sizeof(adv_service_uuid128),
+    .p_service_uuid = adv_service_uuid128,
+    .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
+};
+
+#endif /* CONFIG_SET_RAW_ADV_DATA */
+
+static esp_ble_adv_params_t adv_params = {
+    .adv_int_min        = 0x20,
+    .adv_int_max        = 0x40,
+    .adv_type           = ADV_TYPE_IND,
+    .own_addr_type      = BLE_ADDR_TYPE_PUBLIC,
+    //.peer_addr            =
+    //.peer_addr_type       =
+    .channel_map        = ADV_CHNL_ALL,
+    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+};
+
+#define PROFILE_NUM 1
+#define PROFILE_A_APP_ID 0
+
+struct gatts_profile_inst {
+    esp_gatts_cb_t gatts_cb;
+    uint16_t gatts_if;
+    uint16_t app_id;
+    uint16_t conn_id;
+    uint16_t service_handle;
+    esp_gatt_srvc_id_t service_id;
+    uint16_t char_handle;
+    esp_bt_uuid_t char_uuid;
+    esp_gatt_perm_t perm;
+    esp_gatt_char_prop_t property;
+    uint16_t descr_handle;
+    esp_bt_uuid_t descr_uuid;
+};
+
+/* One gatt-based profile one app_id and one gatts_if, this array will store the gatts_if returned by ESP_GATTS_REG_EVT */
+static struct gatts_profile_inst gl_profile_tab[PROFILE_NUM] = {
+    [PROFILE_A_APP_ID] = {
+        .gatts_cb = gatts_profile_a_event_handler,
+        .gatts_if = ESP_GATT_IF_NONE,       /* Not get the gatt_if, so initial is ESP_GATT_IF_NONE */
+    },
+};
+
+typedef struct {
+    uint8_t                 *prepare_buf;
+    int                     prepare_len;
+} prepare_type_env_t;
+
+static prepare_type_env_t a_prepare_write_env;
+
+void example_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param);
+void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param);
+//check sum of specific array
+static uint8_t check_sum(uint8_t *addr, uint16_t count)
+{
+    uint32_t sum = 0;
+
+    if (addr == NULL || count == 0) {
+        return 0;
+    }
+
+    for(int i = 0; i < count; i++) {
+        sum = sum + addr[i];
+    }
+
+    while (sum >> 8) {
+        sum = (sum & 0xff) + (sum >> 8);
+    }
+
+    return (uint8_t)~sum;
+}
+
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
+{
+    switch (event) {
+#ifdef CONFIG_SET_RAW_ADV_DATA
+    case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
+        adv_config_done &= (~adv_config_flag);
+        if (adv_config_done==0){
+            esp_ble_gap_start_advertising(&adv_params);
+        }
+        break;
+    case ESP_GAP_BLE_SCAN_RSP_DATA_RAW_SET_COMPLETE_EVT:
+        adv_config_done &= (~scan_rsp_config_flag);
+        if (adv_config_done==0){
+            esp_ble_gap_start_advertising(&adv_params);
+        }
+        break;
+#else
+    case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
+        adv_config_done &= (~adv_config_flag);
+        if (adv_config_done == 0){
+            esp_ble_gap_start_advertising(&adv_params);
+        }
+        break;
+    case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT:
+        adv_config_done &= (~scan_rsp_config_flag);
+        if (adv_config_done == 0){
+            esp_ble_gap_start_advertising(&adv_params);
+        }
+        break;
+#endif
+    case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+        //advertising start complete event to indicate advertising start successfully or failed
+        if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGE(GATTS_TAG, "Advertising start failed, status %d", param->adv_start_cmpl.status);
+            break;
+        }
+        ESP_LOGI(GATTS_TAG, "Advertising start successfully");
+        break;
+    case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
+        if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGE(GATTS_TAG, "Advertising stop failed, status %d", param->adv_stop_cmpl.status);
+            break;
+        }
+        ESP_LOGI(GATTS_TAG, "Advertising stop successfully");
+        break;
+    case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
+         ESP_LOGI(GATTS_TAG, "Connection params update, status %d, conn_int %d, latency %d, timeout %d",
+                  param->update_conn_params.status,
+                  param->update_conn_params.conn_int,
+                  param->update_conn_params.latency,
+                  param->update_conn_params.timeout);
+        break;
+    case ESP_GAP_BLE_SET_PKT_LENGTH_COMPLETE_EVT:
+        ESP_LOGI(GATTS_TAG, "Packet length update, status %d, rx %d, tx %d",
+                  param->pkt_data_length_cmpl.status,
+                  param->pkt_data_length_cmpl.params.rx_len,
+                  param->pkt_data_length_cmpl.params.tx_len);
+        break;
+    default:
+        break;
+    }
+}
+
+void example_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param){
+    esp_gatt_status_t status = ESP_GATT_OK;
+    if (param->write.need_rsp){
+        if (param->write.is_prep) {
+            if (param->write.offset > PREPARE_BUF_MAX_SIZE) {
+                status = ESP_GATT_INVALID_OFFSET;
+            } else if ((param->write.offset + param->write.len) > PREPARE_BUF_MAX_SIZE) {
+                status = ESP_GATT_INVALID_ATTR_LEN;
+            }
+            if (status == ESP_GATT_OK && prepare_write_env->prepare_buf == NULL) {
+                prepare_write_env->prepare_buf = (uint8_t *)malloc(PREPARE_BUF_MAX_SIZE*sizeof(uint8_t));
+                prepare_write_env->prepare_len = 0;
+                if (prepare_write_env->prepare_buf == NULL) {
+                    ESP_LOGE(GATTS_TAG, "Gatt_server prep no mem");
+                    status = ESP_GATT_NO_RESOURCES;
+                }
+            }
+
+            esp_gatt_rsp_t *gatt_rsp = (esp_gatt_rsp_t *)malloc(sizeof(esp_gatt_rsp_t));
+            if (gatt_rsp) {
+                gatt_rsp->attr_value.len = param->write.len;
+                gatt_rsp->attr_value.handle = param->write.handle;
+                gatt_rsp->attr_value.offset = param->write.offset;
+                gatt_rsp->attr_value.auth_req = ESP_GATT_AUTH_REQ_NONE;
+                memcpy(gatt_rsp->attr_value.value, param->write.value, param->write.len);
+                esp_err_t response_err = esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, status, gatt_rsp);
+                if (response_err != ESP_OK){
+                    ESP_LOGE(GATTS_TAG, "Send response error\n");
+                }
+                free(gatt_rsp);
+            } else {
+                ESP_LOGE(GATTS_TAG, "malloc failed, no resource to send response error\n");
+                status = ESP_GATT_NO_RESOURCES;
+            }
+            if (status != ESP_GATT_OK){
+                return;
+            }
+            memcpy(prepare_write_env->prepare_buf + param->write.offset,
+                   param->write.value,
+                   param->write.len);
+            prepare_write_env->prepare_len += param->write.len;
+
+        }else{
+            esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, status, NULL);
+        }
+    }
+}
+
+void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param){
+    if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC){
+        ESP_LOG_BUFFER_HEX(GATTS_TAG, prepare_write_env->prepare_buf, prepare_write_env->prepare_len);
+    }else{
+        ESP_LOGI(GATTS_TAG,"Prepare write cancel");
+    }
+    if (prepare_write_env->prepare_buf) {
+        free(prepare_write_env->prepare_buf);
+        prepare_write_env->prepare_buf = NULL;
+    }
+    prepare_write_env->prepare_len = 0;
+}
+
+static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
+    switch (event) {
+    case ESP_GATTS_REG_EVT:
+        ESP_LOGI(GATTS_TAG, "GATT server register, status %d, app_id %d, gatts_if %d", param->reg.status, param->reg.app_id, gatts_if);
+        gl_profile_tab[PROFILE_A_APP_ID].service_id.is_primary = true;
+        gl_profile_tab[PROFILE_A_APP_ID].service_id.id.inst_id = 0x00;
+        gl_profile_tab[PROFILE_A_APP_ID].service_id.id.uuid.len = ESP_UUID_LEN_16;
+        gl_profile_tab[PROFILE_A_APP_ID].service_id.id.uuid.uuid.uuid16 = GATTS_SERVICE_UUID_TEST_A;
+        gl_profile_tab[PROFILE_A_APP_ID].gatts_if = gatts_if; 
+
+        esp_err_t set_dev_name_ret = esp_ble_gap_set_device_name(test_device_name);
+        if (set_dev_name_ret){
+            ESP_LOGE(GATTS_TAG, "set device name failed, error code = %x", set_dev_name_ret);
+        }
+#ifdef CONFIG_EXAMPLE_SET_RAW_ADV_DATA
+        esp_err_t raw_adv_ret = esp_ble_gap_config_adv_data_raw(raw_adv_data, sizeof(raw_adv_data));
+        if (raw_adv_ret){
+            ESP_LOGE(GATTS_TAG, "config raw adv data failed, error code = %x ", raw_adv_ret);
+        }
+        adv_config_done |= adv_config_flag;
+        esp_err_t raw_scan_ret = esp_ble_gap_config_scan_rsp_data_raw(raw_scan_rsp_data, sizeof(raw_scan_rsp_data));
+        if (raw_scan_ret){
+            ESP_LOGE(GATTS_TAG, "config raw scan rsp data failed, error code = %x", raw_scan_ret);
+        }
+        adv_config_done |= scan_rsp_config_flag;
+#else
+        //config adv data
+        esp_err_t ret = esp_ble_gap_config_adv_data(&adv_data);
+        if (ret){
+            ESP_LOGE(GATTS_TAG, "config adv data failed, error code = %x", ret);
+        }
+        adv_config_done |= adv_config_flag;
+        //config scan response data
+        ret = esp_ble_gap_config_adv_data(&scan_rsp_data);
+        if (ret){
+            ESP_LOGE(GATTS_TAG, "config scan response data failed, error code = %x", ret);
+        }
+        adv_config_done |= scan_rsp_config_flag;
+
+#endif
+        esp_ble_gatts_create_service(gatts_if, &gl_profile_tab[PROFILE_A_APP_ID].service_id, GATTS_NUM_HANDLE_TEST_A);
+        break;
+    case ESP_GATTS_READ_EVT: {
+        ESP_LOGI(GATTS_TAG, "Characteristic read, conn_id %d, trans_id %" PRIu32 ", handle %d", param->read.conn_id, param->read.trans_id, param->read.handle);
+        esp_gatt_rsp_t rsp;
+        memset(&rsp, 0, sizeof(esp_gatt_rsp_t));
+        rsp.attr_value.handle = param->read.handle;
+        rsp.attr_value.len = 4;
+        rsp.attr_value.value[0] = 0xde;
+        rsp.attr_value.value[1] = 0xed;
+        rsp.attr_value.value[2] = 0xbe;
+        rsp.attr_value.value[3] = 0xef;
+        esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id,
+                                    ESP_GATT_OK, &rsp);
+        break;
+    }
+    case ESP_GATTS_WRITE_EVT: {
+        ESP_LOGI(GATTS_TAG, "Characteristic write, conn_id %d, trans_id %" PRIu32 ", handle %d", param->write.conn_id, param->write.trans_id, param->write.handle);
+        if (!param->write.is_prep){
+            ESP_LOGI(GATTS_TAG, "value len %d, value ", param->write.len);
+            ESP_LOG_BUFFER_HEX(GATTS_TAG, param->write.value, param->write.len);
+            if (gl_profile_tab[PROFILE_A_APP_ID].descr_handle == param->write.handle && param->write.len == 2){
+                uint16_t descr_value = param->write.value[1]<<8 | param->write.value[0];
+                if (descr_value == 0x0001){
+                    if (a_property & ESP_GATT_CHAR_PROP_BIT_NOTIFY){
+                        ESP_LOGI(GATTS_TAG, "Notification enable");
+                        uint8_t notify_data[15];
+                        for (int i = 0; i < sizeof(notify_data); ++i)
+                        {
+                            notify_data[i] = i%0xff;
+                        }
+                        can_send_notify = true;
+                        xSemaphoreGive(gatts_semaphore);
+                        //the size of notify_data[] need less than MTU size
+                        esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, gl_profile_tab[PROFILE_A_APP_ID].char_handle,
+                                                sizeof(notify_data), notify_data, false);
+                    }
+                }else if (descr_value == 0x0002){
+                    if (a_property & ESP_GATT_CHAR_PROP_BIT_INDICATE){
+                        ESP_LOGI(GATTS_TAG, "Indication enable");
+                        uint8_t indicate_data[15];
+                        for (int i = 0; i < sizeof(indicate_data); ++i)
+                        {
+                            indicate_data[i] = i%0xff;
+                        }
+                        //the size of indicate_data[] need less than MTU size
+                        esp_ble_gatts_send_indicate(gatts_if, param->write.conn_id, gl_profile_tab[PROFILE_A_APP_ID].char_handle,
+                                                sizeof(indicate_data), indicate_data, true);
+                    }
+                }
+                else if (descr_value == 0x0000){
+                    can_send_notify = false;
+                    ESP_LOGI(GATTS_TAG, "Notification/Indication disable");
+                }else{
+                    ESP_LOGE(GATTS_TAG, "Unknown descriptor value");
+                    ESP_LOG_BUFFER_HEX(GATTS_TAG, param->write.value, param->write.len);
+                }
+
+            }
+        }
+        example_write_event_env(gatts_if, &a_prepare_write_env, param);
+        break;
+    }
+    case ESP_GATTS_EXEC_WRITE_EVT:
+        ESP_LOGI(GATTS_TAG,"Execute write");
+        esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
+        example_exec_write_event_env(&a_prepare_write_env, param);
+        break;
+    case ESP_GATTS_MTU_EVT:
+        ESP_LOGI(GATTS_TAG, "MTU exchange, MTU %d", param->mtu.mtu);
+        is_connect = true;
+        break;
+    case ESP_GATTS_UNREG_EVT:
+        break;
+    case ESP_GATTS_CREATE_EVT:
+        ESP_LOGI(GATTS_TAG, "Service create, status %d, service_handle %d", param->create.status, param->create.service_handle);
+        gl_profile_tab[PROFILE_A_APP_ID].service_handle = param->create.service_handle;
+        gl_profile_tab[PROFILE_A_APP_ID].char_uuid.len = ESP_UUID_LEN_16;
+        gl_profile_tab[PROFILE_A_APP_ID].char_uuid.uuid.uuid16 = GATTS_CHAR_UUID_TEST_A;
+
+        esp_ble_gatts_start_service(gl_profile_tab[PROFILE_A_APP_ID].service_handle);
+        a_property = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+        esp_err_t add_char_ret = esp_ble_gatts_add_char(gl_profile_tab[PROFILE_A_APP_ID].service_handle, &gl_profile_tab[PROFILE_A_APP_ID].char_uuid,
+                                                        ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+                                                        a_property,
+                                                        &gatts_demo_char1_val, NULL);
+        if (add_char_ret){
+            ESP_LOGE(GATTS_TAG, "add char failed, error code =%x",add_char_ret);
+        }
+        break;
+    case ESP_GATTS_ADD_INCL_SRVC_EVT:
+        break;
+    case ESP_GATTS_ADD_CHAR_EVT: {
+        uint16_t length = 0;
+        const uint8_t *prf_char;
+
+        ESP_LOGI(GATTS_TAG, "Characteristic add, status %d, attr_handle %d, service_handle %d",
+                param->add_char.status, param->add_char.attr_handle, param->add_char.service_handle);
+        gl_profile_tab[PROFILE_A_APP_ID].char_handle = param->add_char.attr_handle;
+        gl_profile_tab[PROFILE_A_APP_ID].descr_uuid.len = ESP_UUID_LEN_16;
+        gl_profile_tab[PROFILE_A_APP_ID].descr_uuid.uuid.uuid16 = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
+        esp_err_t get_attr_ret = esp_ble_gatts_get_attr_value(param->add_char.attr_handle,  &length, &prf_char);
+        if (get_attr_ret == ESP_FAIL){
+            ESP_LOGE(GATTS_TAG, "ILLEGAL HANDLE");
+        }
+
+        ESP_LOGI(GATTS_TAG, "the gatts demo char length = %x", length);
+        for(int i = 0; i < length; i++){
+            ESP_LOGI(GATTS_TAG, "prf_char[%x] =%x",i,prf_char[i]);
+        }
+        esp_err_t add_descr_ret = esp_ble_gatts_add_char_descr(gl_profile_tab[PROFILE_A_APP_ID].service_handle, &gl_profile_tab[PROFILE_A_APP_ID].descr_uuid,
+                                                                ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, NULL, NULL);
+        if (add_descr_ret){
+            ESP_LOGE(GATTS_TAG, "add char descr failed, error code =%x", add_descr_ret);
+        }
+        break;
+    }
+    case ESP_GATTS_ADD_CHAR_DESCR_EVT:
+        gl_profile_tab[PROFILE_A_APP_ID].descr_handle = param->add_char_descr.attr_handle;
+        ESP_LOGI(GATTS_TAG, "Descriptor add, status %d, attr_handle %d, service_handle %d",
+                 param->add_char_descr.status, param->add_char_descr.attr_handle, param->add_char_descr.service_handle);
+        break;
+    case ESP_GATTS_DELETE_EVT:
+        break;
+    case ESP_GATTS_START_EVT:
+        ESP_LOGI(GATTS_TAG, "Service start, status %d, service_handle %d",
+                 param->start.status, param->start.service_handle);
+        break;
+    case ESP_GATTS_STOP_EVT:
+        break;
+    case ESP_GATTS_CONNECT_EVT: {
+        esp_ble_conn_update_params_t conn_params = {0};
+        memcpy(conn_params.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+        /* For the IOS system, please reference the apple official documents about the ble connection parameters restrictions. */
+        conn_params.latency = 0;
+        conn_params.max_int = 0x20;    // max_int = 0x20*1.25ms = 40ms
+        conn_params.min_int = 0x10;    // min_int = 0x10*1.25ms = 20ms
+        conn_params.timeout = 400;    // timeout = 400*10ms = 4000ms
+        ESP_LOGI(GATTS_TAG, "Connected, conn_id %u, remote "ESP_BD_ADDR_STR"",
+                 param->connect.conn_id, ESP_BD_ADDR_HEX(param->connect.remote_bda));
+        gl_profile_tab[PROFILE_A_APP_ID].conn_id = param->connect.conn_id;
+        //start sent the update connection parameters to the peer device.
+        esp_ble_gap_update_conn_params(&conn_params);
+        
+        break;
+    }
+    case ESP_GATTS_DISCONNECT_EVT:
+        is_connect = false;
+        ESP_LOGI(GATTS_TAG, "Disconnected, remote "ESP_BD_ADDR_STR", reason 0x%02x",
+                 ESP_BD_ADDR_HEX(param->disconnect.remote_bda), param->disconnect.reason);
+        esp_ble_gap_start_advertising(&adv_params);
+        break;
+    case ESP_GATTS_CONF_EVT:
+       // ESP_LOGI(GATTS_TAG, "Confirm receive, status %d, attr_handle %d", param->conf.status, param->conf.handle);
+        if (param->conf.status != ESP_GATT_OK){
+            ESP_LOG_BUFFER_HEX(GATTS_TAG, param->conf.value, param->conf.len);
+        }
+        break;
+    case ESP_GATTS_OPEN_EVT:
+    case ESP_GATTS_CANCEL_OPEN_EVT:
+    case ESP_GATTS_CLOSE_EVT:
+    case ESP_GATTS_LISTEN_EVT:
+    case ESP_GATTS_CONGEST_EVT:
+        if (param->congest.congested) {
+            can_send_notify = false;
+        } else {
+            can_send_notify = true;
+            xSemaphoreGive(gatts_semaphore);
+        }
+    default:
+        break;
+    }
+}
+
+static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param)
+{
+    /* If event is register event, store the gatts_if for each profile */
+    if (event == ESP_GATTS_REG_EVT) {
+        if (param->reg.status == ESP_GATT_OK) {
+            gl_profile_tab[param->reg.app_id].gatts_if = gatts_if;
+        } else {
+            ESP_LOGI(GATTS_TAG, "Reg app failed, app_id %04x, status %d",
+                    param->reg.app_id,
+                    param->reg.status);
+            return;
+        }
+    }
+
+    /* If the gatts_if equal to profile A, call profile A cb handler,
+     * so here call each profile's callback */
+    do {
+        int idx;
+        for (idx = 0; idx < PROFILE_NUM; idx++) {
+            if (gatts_if == ESP_GATT_IF_NONE || /* ESP_GATT_IF_NONE, not specify a certain gatt_if, need to call every profile cb function */
+                    gatts_if == gl_profile_tab[idx].gatts_if) {
+                if (gl_profile_tab[idx].gatts_cb) {
+                    gl_profile_tab[idx].gatts_cb(event, gatts_if, param);
+                }
+            }
+        }
+    } while (0);
+}
+__attribute__((optimize("O2"))) 
+void IRAM_ATTR throughput_server_task(void *param)
+{
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+    //uint8_t sum = check_sum(indicate_data, sizeof(indicate_data) - 1);
+    // Added the check sum in the last data value.
+    //indicate_data[GATTS_NOTIFY_LEN - 1] = sum;
+    uint8_t* ringbuffers[] = {ads_buffers_ext,afe_buffers_ext,adxl_buffers_ext};
+    uint16_t ringbuffer_size[3] = {0};
+    uint32_t package_index = 0;
+    while(1) {
+        if (!can_send_notify) {
+            int res = xSemaphoreTake(gatts_semaphore, portMAX_DELAY);
+            assert(res == pdTRUE); 
+            package_index = 0;
+        } else {
+            if (is_connect) {
+                //start package
+                ble_packet_data[0] = 204;
+                //get data size of each sensor
+                ringbuffer_size[0] = (ads_buf_head  + RINGBUFFER_SIZE_T - ads_buf_tail)  &0xff;
+                ringbuffer_size[1] = (afe_buf_head  + RINGBUFFER_SIZE_T - afe_buf_tail)  &0xff;
+                ringbuffer_size[2]=  (adxl_buf_head + RINGBUFFER_SIZE_T - adxl_buf_tail) &0xff;
+                int16_t sum_channel = ringbuffer_size[0] + ringbuffer_size[1] + ringbuffer_size[2];
+                if(!sum_channel)
+                {
+                    continue;
+                }
+                int16_t tail[] = {ads_buf_tail,afe_buf_tail,adxl_buf_tail};
+                //204|ads_size|afe_size|adxl_size|ads_data|afe_data|adxl_data|package_index(4byte)|all_check_sum 512-9 bytes avaliable
+                //min channel
+                uint16_t min_channel = ringbuffer_size[0]>ringbuffer_size[1]?ringbuffer_size[1]>ringbuffer_size[2]?2:1:ringbuffer_size[0]>ringbuffer_size[2]?2:0;
+                //send all max channel and mid channel
+                int16_t overflow_data = sum_channel - (GATTS_NOTIFY_LEN - 8);
+                if(overflow_data > 0)
+                {
+                    
+                    if(sum_channel - ringbuffer_size[min_channel] >= (GATTS_NOTIFY_LEN - 12))
+                    {
+                        ESP_LOGI(TAG,"%s","OVFLW");
+                        ads_buf_tail = ads_buf_head;
+                        afe_buf_tail = afe_buf_head;
+                        adxl_buf_tail = adxl_buf_head;
+                        continue;
+                    }
+                    else
+                    {
+                        ringbuffer_size[min_channel] = 0;
+                    }
+                }
+                ble_packet_data[1] = ringbuffer_size[0];
+                ble_packet_data[2] = ringbuffer_size[1];
+                ble_packet_data[3] = ringbuffer_size[2];
+                uint16_t curr_index = 4;
+                for(int i = 0;i<3;++i)
+                {
+                    if(ringbuffer_size[i] == 0) continue;
+                    int reamains = (tail[i] + ringbuffer_size[i]) - RINGBUFFER_SIZE_T;
+                    if(reamains <  0)
+                    {
+                        memcpy(ble_packet_data + curr_index, ringbuffers[i] + tail[i], ringbuffer_size[i]);
+                        curr_index += ringbuffer_size[i];
+                    }
+                    else
+                    {
+                        uint16_t first_part = ringbuffer_size[i] - reamains;
+                        memcpy(ble_packet_data + curr_index, ringbuffers[i] + tail[i], first_part);
+                        curr_index += first_part;
+                        memcpy(ble_packet_data + curr_index, ringbuffers[i], reamains);
+                        curr_index += reamains;
+                    }
+                    tail[i] = (tail[i] + ringbuffer_size[i]) & 0xff;
+                }
+                //ESP_LOGI(TAG,"%u",ringbuffer_size[0]);
+                ads_buf_tail = tail[0];
+                afe_buf_tail = tail[1];
+                adxl_buf_tail = tail[2];
+                memcpy(ble_packet_data+curr_index,(void*)&package_index,4);
+                curr_index = curr_index + 4;
+                package_index++;
+                ble_packet_data[curr_index] = check_sum(ble_packet_data,curr_index);
+                curr_index++;
+                //memset(ble_packet_data+1,1,sizeof(ble_packet_data)-1);
+                int free_buff_num = esp_ble_get_cur_sendable_packets_num(gl_profile_tab[PROFILE_A_APP_ID].conn_id);
+                if(free_buff_num > 0) {
+                    //for( ; free_buff_num > 0; free_buff_num--) {
+                        esp_ble_gatts_send_indicate(gl_profile_tab[PROFILE_A_APP_ID].gatts_if, gl_profile_tab[PROFILE_A_APP_ID].conn_id,
+                                                    gl_profile_tab[PROFILE_A_APP_ID].char_handle,
+                                                    curr_index, ble_packet_data, false);
+                                                    //sizeof(ble_packet_data), ble_packet_data, false);
+                    //}
+                } else { //Add the vTaskDelay to prevent this task from consuming the CPU all the time, causing low-priority tasks to not be executed at all.
+                    //vTaskDelay( 10 / portTICK_PERIOD_MS );
+                }
+            } else {
+                // vTaskDelay(100 / portTICK_PERIOD_MS);
+            }
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+void app_main(void)
+{
+    /*create ring buffers for afe and ads*/
+    //ads_buffers  = xRingbufferCreate(RINGBUFFER_SIZE, RINGBUF_TYPE_NOSPLIT);
+    //afe_buffers  = xRingbufferCreate(RINGBUFFER_SIZE, RINGBUF_TYPE_NOSPLIT);
+    //adxl_buffers = xRingbufferCreate(RINGBUFFER_SIZE, RINGBUF_TYPE_NOSPLIT);
+
+    /*register afe,ads,adxl interrupt task*/
+    //xTaskCreate(afe_task, "AFE Task", 512, NULL, 10, &afe_task_handle);
+    //xTaskCreate(ads_task, "ADS Task", 768, NULL, 10, &ads_task_handle);
+    //since we need to use sync mode to initialize adxl345, we call this function later
+    //xTaskCreate(adxl_task,"ADXL Task",2048, NULL,I2C_TASK_PRIO,&i2c_task_handle);
+
+    /*install isr server of three devices*/
+    esp_err_t ret = gpio_install_isr_service(0);
+    assert(ret == ESP_OK);
+    /*---------------------AFE4400 initialization-------------*/
+    ESP_LOGI(TAG,"%s","AFE4400 start_initialization...");
+    gpio_reset_pin(AFE44X0_PIN_PDNZ);
+    /*hardware reset*/
+    gpio_config_t io_conf0 = {
+        .pin_bit_mask = (1ULL << AFE44X0_PIN_PDNZ),  // 配置的引脚
+        .mode = GPIO_MODE_OUTPUT,           // 设置为输出模式
+        .pull_up_en = GPIO_PULLUP_DISABLE,  // 禁用上拉
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, // 禁用下拉
+        .intr_type = GPIO_INTR_DISABLE      // 不启用中断
+    };
+    ret = gpio_config(&io_conf0);
+    assert(ret == ESP_OK);
+
+    /*software spi using delicated spi in asm*/
+    soft_spi_config_t s_spi_config;
+    s_spi_config.clk_pin = AFE44X0_PIN_CLK;
+    s_spi_config.cs_pin = AFE44X0_PIN_CS;
+    s_spi_config.miso_pin = AFE44X0_PIN_MISO;
+    s_spi_config.mosi_pin = AFE44X0_PIN_MOSI;
+    ESP_LOGI(TAG,"%s","AFE4400 RESET PDNZ PIN");
+    /*hardware reset*/
+    gpio_set_level(AFE44X0_PIN_PDNZ, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(AFE44X0_PIN_PDNZ, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ret = soft_spi_new(&s_spi_config,&s_spi_bus);
+
+
+    AFE44x0_Initialization_software(s_spi_bus);
+
+    /*initialize isr of afe4400 dataready*/
+        /*afe44x0 data ready signal*/
+    gpio_reset_pin(AFE44X0_PIN_RDY);
+    gpio_config_t io_conf1 = {
+        .intr_type = GPIO_INTR_POSEDGE,  // 上升沿触发
+        .mode = GPIO_MODE_INPUT,        // 配置为输入模式
+        .pin_bit_mask = (1ULL << AFE44X0_PIN_RDY), // 选择 GPIO 引脚
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, // 禁用下拉电阻
+        .pull_up_en = GPIO_PULLUP_ENABLE       // 启用上拉电阻
+    };
+    ret = gpio_config(&io_conf1);
+    assert(ret == ESP_OK);
+    ret = gpio_isr_handler_add(AFE44X0_PIN_RDY, &AFE44X0_gpio_isr_handler, NULL);
+    assert(ret == ESP_OK);
+    ESP_LOGI(TAG,"%s","AFE4400 end_initialization");
+    /*---------------------AFE4400 end initialization-------------*/
+
+    /*---------------------ADS1220 initialization-------------*/
+    ESP_LOGI(TAG,"%s","ADS1220 start_initialization...");
+    spi_bus_config_t buscfg = {
+        .miso_io_num = ADS1220_PIN_MISO,
+        .mosi_io_num = ADS1220_PIN_MOSI,
+        .sclk_io_num = ADS1220_PIN_CLK,
+        .flags = SPICOMMON_BUSFLAG_MASTER,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 8,
+    };
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = 10 * 1000 * 1000,      //Clock out at 5 MHz
+        //.clock_speed_hz = 125 * 1000,         //Clock out at 1 MHz
+        .mode = 1,                              //SPI mode 0
+        .spics_io_num = ADS1220_PIN_CS,             //CS pin
+        .dummy_bits = 0,
+        .clock_source = SPI_CLK_SRC_DEFAULT,
+        .duty_cycle_pos = 0,
+        .input_delay_ns = 10,
+        .cs_ena_pretrans = 1,       ///< Amount of SPI bit-cycles the cs should be activated before the transmission (0-16). This only works on half-duplex transactions.
+        .cs_ena_posttrans = 1,
+        .queue_size = 16                        //We want to be able to queue 10 transactions at a time
+    };
+    //Initialize the SPI bus
+    ret = spi_bus_initialize(CUSTOM_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    ESP_ERROR_CHECK(ret);
+    ret = spi_bus_add_device(CUSTOM_SPI_HOST, &devcfg, &ads_spi);
+    ESP_ERROR_CHECK(ret);
+    /*finaly: ads 1220 data ready signal isr register*/
+    gpio_reset_pin(ADS1220_PIN_RDY);
+    gpio_config_t io_conf2 = {
+        .intr_type = GPIO_INTR_NEGEDGE,  // 下降沿触发
+        .mode = GPIO_MODE_INPUT,        // 配置为输入模式
+        .pin_bit_mask = (1ULL << ADS1220_PIN_RDY), // 选择 GPIO 引脚
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, // 禁用下拉电阻
+        .pull_up_en = GPIO_PULLUP_ENABLE       // 启用上拉电阻
+    };
+    ret = gpio_config(&io_conf2);
+    assert(ret == ESP_OK);
+    //reset and initialization
+    ADS1220_initialization(ads_spi);
+    //isr register
+    vTaskDelay(pdMS_TO_TICKS(1));//delay 1 ms to avoid missed one conversion
+    //register isr
+    ret = gpio_isr_handler_add(ADS1220_PIN_RDY, &ADS1220_gpio_isr_handler, NULL);
+    spi_transaction_t trans_8 ={
+        .length = 8,
+        .flags = SPI_TRANS_USE_TXDATA
+    };
+    //trigger one conversion to start interrupt
+    ADS1220_sendCMD(ads_spi,&trans_8,ADS_CMD_START); 
+    
+    assert(ret == ESP_OK);
+    ESP_LOGI(TAG,"%s","ADS1220 end_initialization");
+    /*---------------------ADS1220 end initialization-------------*/
+
+    /*---------------------ADXL345 initialization-------------*/
+    ESP_LOGI(TAG,"%s","ADXL345 start_initialization...");
+    i2c_master_bus_config_t i2c_mst_config = {
+    .clk_source = I2C_CLK_SRC_DEFAULT,
+    .i2c_port = I2C_NUM_0,
+    .scl_io_num = ADXL_PIN_SCL,
+    .sda_io_num = ADXL_PIN_SDA,
+    .glitch_ignore_cnt = 7,
+    .flags.enable_internal_pullup = true,
+    .trans_queue_depth = 8, //
+    };
+    i2c_device_config_t dev_cfg;
+    i2c_master_bus_handle_t i2c_bus_handle;
+	
+	// add device
+	dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+	dev_cfg.device_address = I2C_DEVICE;
+	dev_cfg.scl_speed_hz = 400*1000; //200khz
+
+    ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_mst_config, &i2c_bus_handle));
+	ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus_handle, &dev_cfg, &i2c_dev_handle) != ESP_OK);
+
+    //initialization using sync mode
+    ADXL345_initialization(i2c_dev_handle);
+
+    //isr register
+    gpio_reset_pin(ADXL_PIN_INT1);
+    gpio_config_t io_conf3 = {
+        .intr_type = GPIO_INTR_POSEDGE,  // 上升沿触发
+        .mode = GPIO_MODE_INPUT,        // 配置为输入模式
+        .pin_bit_mask = (1ULL << ADXL_PIN_INT1), // 选择 GPIO 引脚
+        .pull_down_en = GPIO_PULLDOWN_DISABLE, // 禁用下拉电阻
+        .pull_up_en = GPIO_PULLUP_DISABLE      
+    };
+    ret = gpio_config(&io_conf3);
+    assert(ret == ESP_OK);
+    ret = gpio_isr_handler_add(ADXL_PIN_INT1, &ADXL345_gpio_isr_handler, NULL);
+    assert(ret == ESP_OK);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    //trigger one conversion to start interrupt
+    ret = i2c_master_transmit_receive(i2c_dev_handle, (void *) &i2c_target, 1,i2c_recv_data,6,1000);
+    assert(ret == ESP_OK);
+    ESP_LOGI(TAG,"%s","ADXL345 end_initialization");
+    /*---------------------ADSL345 end initialization-------------*/
+    vTaskDelay(pdMS_TO_TICKS(1));
+
+    /*-------------------Ble initialization-----------------*/
+    // Initialize NVS.
+    ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK( ret );
+
+    #if CONFIG_EXAMPLE_CI_PIPELINE_ID
+    memcpy(test_device_name, esp_bluedroid_get_example_name(), ESP_BLE_ADV_NAME_LEN_MAX);
+    #endif
+
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ret = esp_bt_controller_init(&bt_cfg);
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "%s initialize controller failed: %s", __func__, esp_err_to_name(ret));
+        return;
+    }
+
+    ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "%s enable controller failed: %s", __func__, esp_err_to_name(ret));
+        return;
+    }
+
+    ret = esp_bluedroid_init();
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "%s init bluetooth failed: %s", __func__, esp_err_to_name(ret));
+        return;
+    }
+    ret = esp_bluedroid_enable();
+    if (ret) {
+        ESP_LOGE(GATTS_TAG, "%s enable bluetooth failed: %s", __func__, esp_err_to_name(ret));
+        return;
+    }
+    // Note: Avoid performing time-consuming operations within callback functions.
+    ret = esp_ble_gatts_register_callback(gatts_event_handler);
+    if (ret){
+        ESP_LOGE(GATTS_TAG, "gatts register error, error code = %x", ret);
+        return;
+    }
+    ret = esp_ble_gap_register_callback(gap_event_handler);
+    if (ret){
+        ESP_LOGE(GATTS_TAG, "gap register error, error code = %x", ret);
+        return;
+    }
+    ret = esp_ble_gatts_app_register(PROFILE_A_APP_ID);
+    if (ret){
+        ESP_LOGE(GATTS_TAG, "gatts app register error, error code = %x", ret);
+        return;
+    }
+    esp_err_t local_mtu_ret = esp_ble_gatt_set_local_mtu(517);
+    if (local_mtu_ret){
+        ESP_LOGE(GATTS_TAG, "set local  MTU failed, error code = %x", local_mtu_ret);
+    }
+    xTaskCreatePinnedToCore(&throughput_server_task, "throughput_server_task", 4096, NULL, 15, NULL, BLUETOOTH_TASK_PINNED_TO_CORE);
+    gatts_semaphore = xSemaphoreCreateBinary();
+    if (!gatts_semaphore) {
+        ESP_LOGE(GATTS_TAG, "%s, init fail, the gatts semaphore create fail.", __func__);
+        return;
+    }
+
+    int count   = 0;
+    int count1  = 0;
+    int count2  = 0;
+    while(1)
+    {
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        // if(afe_interrupt_val> 0)
+        // {
+        //     while(1)
+        //     {
+        //         ESP_LOGI(TAG,"%u,%u",afe_buf_head,afe_buf_tail);
+        //         if(afe_buf_tail == afe_buf_head){break;}
+        //         uint8_t resolve_buf[6];
+        //         for(int i = 0;i<6;++i)
+        //         {
+        //             resolve_buf[i] = afe_buffers_ext[afe_buf_tail];
+        //             afe_buf_tail = (afe_buf_tail+1) & 0xff;
+        //         }
+        //         uint32_t val0 = (uint32_t)resolve_buf[0] << 16 | (uint32_t)resolve_buf[1] << 8 | (uint32_t)resolve_buf[2];
+        //         uint32_t val1 = (uint32_t)resolve_buf[3] << 16 | (uint32_t)resolve_buf[4] << 8 | (uint32_t)resolve_buf[5];
+        //         count1 ++;
+        //         if(count1%30 == 0)
+        //         ESP_LOGI("AFE","res:%u,%u,(%u),(%u),%u",(unsigned int)val0,(unsigned int)val1,(unsigned int)afe_buf_head,(unsigned int)afe_buf_tail,count1);
+
+        //     }
+        // }
+        // if(ads_interrupt_val >0)
+        // {
+
+        //     //ESP_LOGI(TAG,"%s:%d","ADS it",ads_interrupt_val);
+        //    while(1)
+        //     {
+        //         if(ads_buf_tail == ads_buf_head){break;}
+        //         uint8_t resolve_buf[12];
+        //         for(int i = 0;i<12;++i)
+        //         {
+        //             resolve_buf[i] = ads_buffers_ext[ads_buf_tail];
+        //             ads_buf_tail = (ads_buf_tail+1) & 0xff;
+        //         }
+        //         count++;
+        //         uint32_t val0 = (uint32_t)resolve_buf[0] << 16 | (uint32_t)resolve_buf[1] << 8 | (uint32_t)resolve_buf[2];
+        //         uint32_t val1 = (uint32_t)resolve_buf[3] << 16 | (uint32_t)resolve_buf[4] << 8 | (uint32_t)resolve_buf[5];
+        //         uint32_t val2 = (uint32_t)resolve_buf[6] << 16 | (uint32_t)resolve_buf[7] << 8 | (uint32_t)resolve_buf[8];
+        //         uint32_t val3 = (uint32_t)resolve_buf[9] << 16 | (uint32_t)resolve_buf[10] << 8 | (uint32_t)resolve_buf[11];
+        //         if(count%2 == 0)
+        //         ESP_LOGI("ADS",":%u,%u,%u,%u,%u:(%d),(%d)",(unsigned int)val0,(unsigned int)val1,(unsigned int)val2,(unsigned int)val3,count,ads_buf_head,ads_buf_tail);
+        //     }      
+        // }
+        // ESP_LOGI(TAG,"ADXL it:%d",adxl_buf_head);
+        // if(adxl_interrupt_val >0)
+        // {
+        //     //ESP_LOGI(TAG,"ADXL it:%d",adxl_buf_head);
+        //     while(1)
+        //     {
+        //         if(adxl_buf_tail == adxl_buf_head){break;}
+        //             uint8_t resolve_buf[6];
+        //             for(int i = 0;i<6;++i)
+        //             {
+        //                 resolve_buf[i] = adxl_buffers_ext[adxl_buf_tail];
+        //                 adxl_buf_tail = (adxl_buf_tail+1) & 0xff;
+        //             }
+        //         count2++;
+        //         uint32_t val0 = (uint32_t)resolve_buf[1] << 8 | (uint32_t)resolve_buf[0];
+        //         uint32_t val1 = (uint32_t)resolve_buf[3] << 8 | (uint32_t)resolve_buf[2];
+        //         uint32_t val2 = (uint32_t)resolve_buf[5] << 8 | (uint32_t)resolve_buf[4];
+        //         if(count2%2 == 0)
+        //         ESP_LOGI("ADXL",":%u,%u,%u,:%d,(%u),(%u)",(unsigned int)val0,(unsigned int)val1,(unsigned int)val2,count2,adxl_buf_head,adxl_buf_tail);
+        //     }      
+        // }
+
+    }
+    return;
+}
