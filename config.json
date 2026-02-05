@@ -1,0 +1,39 @@
+{
+    "name": "Exp1",
+    "n_gpu": 1,
+
+    "arch": {
+        "type": "BPFusionAtten",
+        "args": {
+        }
+    },
+    "data_loader": {
+        "args":{
+            "batch_size": 32,
+            "num_folds": 10
+        }
+    },
+    "optimizer": {
+        "type": "Adam",
+        "args":{
+            "lr": 0.0001,
+            "weight_decay": 0.0005,
+            "amsgrad": true
+        }
+    },
+    "loss": "SmoothL1Loss",
+    "metrics": [
+        "accuracy",
+        "sbp_mae",
+        "sbp_mse",
+        "dbp_mae",
+        "dbp_mse"
+    ],
+    "trainer": {
+        "epochs": 200,
+        "save_dir": "saved/",
+        "save_period": 30,
+        "verbosity": 2,
+        "monitor": "min val_loss"
+    }
+}
